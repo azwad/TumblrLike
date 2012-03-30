@@ -1,0 +1,178 @@
+#!/usr/bin/perl
+use lib qw(/home/toshi/perl/lib);
+use strict;
+use TumblrDashboard;
+use Encode;
+use utf8;
+use Config::Pit;
+use WWW::Mechanize;
+
+
+my @pit_accounts = ('news.azwad.com', 'tumblr.azwad.com','liquige.tumblr.com');
+
+my $dbname = 'tumblr_deduped_check';
+my %deduped = {};
+dbmopen(%deduped, $dbname, 0644);
+my $deduped = \%deduped;
+
+my %reblog_history = {};
+dbmopen(%reblog_history,'reblog_history',0644);
+my $reblog_history = \%reblog_history;
+
+for my $pit_account (@pit_accounts) {
+	my $offset = 0;
+	my $num = 10;
+	my $max = 100;
+	my $type = '';
+	my $delay_time1 = 3;
+	my $delay_time2 = 1;
+	for ($offset = 0; $offset <= $max ; $offset += $num){
+		my $td = TumblrDashboard->new($pit_account);
+		print "offset = ". $offset ." num = ". $num . "\n";
+		my %opt = (
+			'start' => $offset,
+			'num'		=> $num,
+			'type'	=> $type,
+#			'filter'=> 'none',
+			'liked' => 'true',
+		);
+		$td->set_option(%opt);
+#		sleep 60;
+		my $res  = $td->get_hash;
+		next if $td->_err;
+
+		open my $fh2, '>>', 'tumblrdashboard.txt';
+		open my $fh3, '>>', 'dblist.txt';
+
+		while (my ($post, $values) = each %$res) {
+			if (exists $deduped{$post}){
+				print $deduped{$post} ."is match an old post\n";
+				next;
+			}else {
+				my @urls =();
+				for (my ($number, $url) = each %$deduped){
+					push(@urls,$url);
+				}
+				my $date = $values->{date};
+				my $publish_type = $values->{type};
+				$_ =  $values->{'quote-source'} || $values->{'link-description'} || $values->{'photo-caption'};
+				s/<a href="(http.+?)".*>(.+?)<\/a>/$1,$2/ ;
+				my $title = $2 ;
+				my $link =  $1 || $values->{'photo-link-url'} || $values->{'url'};
+				my $from = $values->{tumblelog}[0];
+				print $title." : ".$link ."\n";
+				if ( grep{ $_ eq $link } @urls){
+					print "match listed url\n";
+					next;
+				}else{
+					my $text = $values->{'quote-text'} || $values->{'link-text'} || $values->{'regular-body'};
+					$deduped{$post} = $link;
+					utf8::is_utf8($title)?encode('utf-8',$title):$title;
+					utf8::is_utf8($text)?encode('utf-8', $text):$text;
+					my $reblog_key = $values->{'reblog-key'};
+					my $note_count = $values->{'note-count'};
+					print $fh3 $post." : ".$from ." : " .$publish_type." : ". $reblog_key ." : ". $note_count . " : " .$title."\n";
+					print $fh2 $title." : ".$link."\n";
+					print $fh2 $date." : ".$publish_type."\n";
+					print $fh2 $reblog_key. " : ". $note_count. "\n";
+					print $fh2 "\n";
+					print $fh2 $text."\n";
+					print $fh2 "\n";
+					my $post_to ='';
+					if ($post_to = decide_post_to($post, $link, $publish_type)){
+						print "reblog this post to $post_to\n";
+						reblog($post_to, $post, $reblog_key, $link );
+						unlike($pit_account, $post, $reblog_key);
+						sleep $delay_time1;
+					}else{
+						print "don't reblog\n";
+						next;
+					}
+				}
+			}
+		}
+		sleep $delay_time2;
+		close $fh2;
+		close $fh3;
+	}
+}
+dbmclose(%deduped);
+dbmclose(%reblog_history);
+
+
+
+sub reblog {
+	my ($post_to, $post, $reblog_key, $link) = @_;
+	if (my $res = reblog_post($post_to, $post, $reblog_key)){
+		print "succeed.\n";
+		$reblog_history->{$post} = $link;
+		return;
+	}else{
+		print "reblog failed.\n";
+		return;
+	};
+}
+
+sub decide_post_to {
+	my ($post, $link, $publish_type) = @_;
+	my $post_to ='';
+	if ( $publish_type =~ s/(quote|regular)//){
+		$post_to= 'news.azwad.com';
+	}elsif ( $publish_type =~ s/photo//){
+		$post_to = 'liquige.tumblr.com';
+	}else{
+		$post_to = "";
+	}
+	while  (my ($key, $value) = each %$reblog_history) {
+		if ($key eq $post) {
+			print "$post is already rebloged\n";
+			$post_to = '';
+			return $post_to;
+		}elsif ($value eq $link) {
+		print "$link is already rebloged\n";
+			$post_to = '';
+			return $post_to;
+		}else{
+			next;
+		}
+	}
+	return $post_to;
+}
+
+sub reblog_post{
+	my ($post_to, $post, $reblog_key) = @_;
+	my $reblog_api ='http://www.tumblr.com/api/reblog';
+	my $config = Config::Pit::pit_get($post_to, require => {
+		"user" => "username",
+		"email"=> "email",
+		"password" => "password"
+		}
+	);
+	my $email = $config->{email};
+	my $password = $config->{password};
+	my $url = $reblog_api. "?email=". $email."&password=". $password. "&post-id=". $post. "&reblog-key=".$reblog_key;
+	my $uri = URI->new($url);
+	my $rpost = WWW::Mechanize->new();
+	my $res =	$rpost->get($uri);
+	print $res->{_content}."\n";
+	return $res->{_content};
+}
+
+sub unlike{
+	my ($pit_account, $post, $reblog_key) = @_;
+	my $unlike_api ='http://www.tumblr.com/api/unlike';
+	my $config = Config::Pit::pit_get($pit_account, require => {
+		"user" => "username",
+		"email"=> "email",
+		"password" => "password"
+		}
+	);
+	my $email = $config->{email};
+	my $password = $config->{password};
+	my $url = $unlike_api. "?email=". $email."&password=". $password. "&post-id=". $post. "&reblog-key=".$reblog_key;
+	my $uri = URI->new($url);
+	my $rpost = WWW::Mechanize->new();
+  my  $res =	$rpost->get($uri);
+	print $res->{_content}."\n";
+	return $res->{_content};
+}
